@@ -11,16 +11,17 @@ import torchvision.transforms as transforms
 import datetime
 
 # ==============================
-# Import Vision Mamba
+# ### NEW ###
+# Import from Hugging Face transformers
 # ==============================
 try:
-    from vision_mamba import Vim
+    from transformers import AutoModelForImageClassification, AutoImageProcessor
 except ImportError:
-    raise ImportError("Install Vision Mamba: pip install vision-mamba")
+    raise ImportError("Install Hugging Face transformers: pip install transformers")
 
 
 # ==============================
-# 1. Dataset
+# 1. Dataset (Your class is great, no changes needed)
 # ==============================
 class CustomDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -53,7 +54,7 @@ class CustomDataset(Dataset):
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
             # Return a dummy image and label
-            return torch.randn(3, 128, 128), -1
+            return torch.randn(3, 224, 224), -1 # ### MODIFIED ### to 224x224
 
         if self.transform:
             image = self.transform(image)
@@ -68,34 +69,9 @@ class CustomDataset(Dataset):
 # ==============================
 # 2. Model
 # ==============================
-class VimForClassification(nn.Module):
-    # ** MODIFIED ** Added more parameters to the init
-    def __init__(self, num_classes, image_size=224, patch_size=16, dim=128,
-                 depth=6, heads=4, dt_rank=16, dim_inner=None, d_state=None, channels=3, dropout=0.2):
-
-        super().__init__()
-
-        # Set defaults if None
-        dim_inner = dim_inner if dim_inner is not None else dim
-        d_state = d_state if d_state is not None else dim
-
-        self.vim = Vim(
-            dim=dim,
-            # heads=heads,
-            dt_rank=dt_rank,
-            dim_inner=dim_inner,
-            d_state=d_state,
-            num_classes=num_classes,
-            image_size=image_size,
-            patch_size=patch_size,
-            channels=channels,
-            dropout=dropout,
-            depth=depth
-        )
-
-    def forward(self, x):
-        return self.vim(x)
-
+# ### REMOVED ###
+# The VimForClassification class is no longer needed.
+# We will load the model directly in main().
 
 # ==============================
 # 3. Train & Evaluate
@@ -113,15 +89,26 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(images)
+        
+        # ### MODIFIED ###
+        # Hugging Face models output a class with logits
+        outputs = model(images).logits 
+        
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * images.size(0)
 
+    # ### MODIFIED ### Robust check for empty loader
     if len(loader.dataset) == 0:
-        return 0.0  # Avoid division by zero
-    return total_loss / len(loader.dataset)
+        return 0.0
+    
+    # Calculate loss based on number of items *processed*
+    processed_items = len(loader.dataset) - (labels == -1).sum().item()
+    if processed_items == 0:
+        return 0.0
+        
+    return total_loss / processed_items
 
 
 def evaluate(model, loader, criterion, device):
@@ -138,7 +125,11 @@ def evaluate(model, loader, criterion, device):
                     continue
 
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            
+            # ### MODIFIED ###
+            # Hugging Face models output a class with logits
+            outputs = model(images).logits
+            
             loss = criterion(outputs, labels)
             total_loss += loss.item() * images.size(0)
             _, preds = torch.max(outputs, 1)
@@ -147,11 +138,12 @@ def evaluate(model, loader, criterion, device):
             preds_all.extend(preds.cpu().numpy())
             labels_all.extend(labels.cpu().numpy())
 
-    if len(loader.dataset) == 0 or total == 0:
+    if total == 0: # Check if any valid items were processed
         return 0.0, 0.0, [], []  # Avoid division by zero
 
     acc = correct / total
-    return total_loss / len(loader.dataset), acc, labels_all, preds_all
+    loss_avg = total_loss / total # Average loss per item
+    return loss_avg, acc, labels_all, preds_all
 
 
 # ==============================
@@ -160,80 +152,129 @@ def evaluate(model, loader, criterion, device):
 def main():
     # --- Config ---
     dataset_root = 'dataset'  # <-- Make sure this folder exists
-    results_dir = 'vim_results_lightweight'  # <-- Changed output dir
+    results_dir = 'vim_results_transfer_learning' # <-- Changed output dir
     os.makedirs(results_dir, exist_ok=True)
 
-    # --- ** MODIFIED HYPERPARAMETERS ** ---
-    batch_size = 32        # Was 16
-    num_epochs = 50        # Was 20
-    lr = 1e-4              # Was 5e-4
-    patience = 10          # Was 5
-    weight_decay = 1e-3    # Was 1e-4
-    # --- ** END MODIFICATIONS ** ---
+    # --- Hyperparameters (from your file) ---
+    batch_size = 32
+    num_epochs = 1
+    lr = 1e-4
+    patience = 10
+    weight_decay = 1e-3
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
-    # --- ** MODIFIED DATA AUGMENTATION ** ---
-    # More aggressive augmentation for 128x128 images
-    transform = transforms.Compose([
-        # Use RandomResizedCrop for more variety
-        transforms.RandomResizedCrop((128, 128), scale=(0.8, 1.0)),
+    # --- ### NEW ### Model Loading from Hugging Face ---
+    MODEL_NAME = "google/vit-base-patch16-224-in21k"
+    print(f"Loading pre-trained model: {MODEL_NAME}")
+    
+    # The processor handles image transformations (size, normalization)
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+    model = AutoModelForImageClassification.from_pretrained(
+        MODEL_NAME, 
+        trust_remote_code=True
+    )
+    
+    # Get model's expected input size and normalization stats
+    image_size = processor.size["height"]
+    image_mean = processor.image_mean
+    image_std = processor.image_std
+    
+    print(f"Model loaded. Input size set to: {image_size}x{image_size}")
+
+    # --- ### MODIFIED ### Data Augmentation ---
+    # Transforms MUST match the pre-trained model's expectations
+    
+    train_transform = transforms.Compose([
+        # We must resize to what the model expects
+        transforms.Resize((image_size, image_size)), 
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),  # Slightly more rotation
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
-
-        # TrivialAugment is a strong, modern augmentation technique
-        transforms.TrivialAugmentWide(),
-
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=image_mean, std=image_std)
+    ])
+    
+    val_transform = transforms.Compose([
+        # Validation just needs resize, ToTensor, and Normalize
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=image_mean, std=image_std)
     ])
     # --- ** END MODIFICATIONS ** ---
 
-    dataset = CustomDataset(dataset_root, transform)
-    if len(dataset) == 0:
-        print(
-            f"Error: No images found in {dataset_root}. Please check the path.")
+    # --- ### MODIFIED ### Dataset Splitting ---
+    # This is a robust way to apply different transforms to train/val
+    # after a random split.
+    
+    # 1. Create two dataset instances (one for train, one for val)
+    #    They point to the same data but have different transform pipelines
+    dataset_for_train = CustomDataset(dataset_root, transform=train_transform)
+    dataset_for_val = CustomDataset(dataset_root, transform=val_transform)
+
+    if len(dataset_for_train) == 0:
+        print(f"Error: No images found in {dataset_root}. Please check.")
         return
 
-    num_classes = len(dataset.classes)
-    print(
-        f"Detected {len(dataset)} images in {num_classes} classes: {dataset.classes}")
+    num_classes = len(dataset_for_train.classes)
+    print(f"Detected {len(dataset_for_train)} images in {num_classes} classes: {dataset_for_train.classes}")
 
-    # --- Split ---
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=4)
-
-    # --- ** MODIFIED MODEL INITIALIZATION ** ---
-    print("Initializing Lightweight Vision Mamba (Vim)...")
-    model = VimForClassification(
-        num_classes=num_classes,
-        image_size=128,
-        patch_size=16,  # 8x8=64 patches
-        dim=48,         # smaller than 64
-        depth=3,        # fewer blocks
-        heads=2,
-        dt_rank=8,
-        dropout=0.5     # stronger dropout
-    ).to(device)
-
-    # --- ** END MODIFICATIONS ** ---
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay  # <-- Use modified weight_decay
+    # 2. Perform the split on one dataset to get indices
+    train_size = int(0.8 * len(dataset_for_train))
+    val_size = len(dataset_for_train) - train_size
+    
+    # Use a fixed generator for reproducible splits
+    train_subset, val_subset = random_split(
+        dataset_for_train, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42) # For reproducibility
     )
 
-    # --- Training Loop ---
+    # 3. CRITICAL: Point the val_subset to use the val_dataset instance
+    #    This ensures it uses the validation transforms
+    val_subset.dataset = dataset_for_val
+    
+    # Now train_subset uses train_transform, and val_subset uses val_transform
+
+    train_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(
+        val_subset, batch_size=batch_size, num_workers=4)
+    # --- ** END MODIFICATIONS ** ---
+
+
+    # --- ### NEW ### Freeze Backbone & Replace Head ---
+    print("Adapting model for transfer learning...")
+    
+    # 1. Freeze the backbone (the 'mambavision' part)
+    # 1. Freeze the backbone (the 'vit' part)
+    for param in model.vit.parameters():
+        param.requires_grad = False
+    
+    # 2. Get the number of input features for the classifier
+    in_features = model.classifier.in_features
+    
+    # 3. Replace the classifier head with a new, unfrozen one
+    model.classifier = nn.Linear(in_features, num_classes)
+    
+    model.to(device) # Move the *entire* model to the device
+    
+    # --- ** END NEW ** ---
+
+    criterion = nn.CrossEntropyLoss()
+    
+    # --- ### MODIFIED ### Optimizer ---
+    # We ONLY optimize the parameters of the new classifier
+    print("Optimizing ONLY the new classifier head.")
+    optimizer = torch.optim.AdamW(
+        model.classifier.parameters(), # <-- This is the key change
+        lr=lr,
+        weight_decay=weight_decay
+    )
+    # --- ** END MODIFICATIONS ** ---
+
+    # --- Training Loop (Your excellent loop is unchanged) ---
     best_acc = 0.0
     patience_counter = 0
     train_losses, val_losses = [], []
@@ -266,7 +307,7 @@ def main():
                     f"Early stopping triggered after {patience} epochs with no improvement.")
                 break
 
-    # Check if any evaluation was actually run
+    # --- Logging & Plotting (Your code is unchanged) ---
     if not true_labels or not preds:
         print("Evaluation did not run. Skipping plots and metrics.")
         print(f"\nAll results saved under: {os.path.abspath(results_dir)}")
@@ -279,7 +320,7 @@ def main():
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.legend()
-    plt.title("Training and Validation Loss (Lightweight Vim)")
+    plt.title("Training and Validation Loss (Transfer Learning Vim)")
     loss_plot_path = os.path.join(results_dir, "loss_curve.png")
     plt.savefig(loss_plot_path)
     print(f"Saved: {loss_plot_path}")
@@ -287,7 +328,10 @@ def main():
 
     # --- Confusion Matrix ---
     cm = confusion_matrix(true_labels, preds)
-    cm_percent = cm.astype(float) / cm.sum(axis=1)[:, None] * 100
+    # Fix for divide-by-zero if a class has 0 true samples in val set
+    cm_sum = cm.sum(axis=1)[:, None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cm_percent = np.nan_to_num(cm.astype(float) / cm_sum * 100)
 
     plt.figure(figsize=(max(6, num_classes), max(5, num_classes * 0.8)))
     plt.imshow(cm_percent, cmap='Blues',
@@ -295,17 +339,15 @@ def main():
     plt.title("Confusion Matrix (%)")
     plt.colorbar()
     ticks = np.arange(num_classes)
-    plt.xticks(ticks, dataset.classes, rotation=45, ha="right")
-    plt.yticks(ticks, dataset.classes)
+    plt.xticks(ticks, dataset_for_train.classes, rotation=45, ha="right")
+    plt.yticks(ticks, dataset_for_train.classes)
 
-    # Text color threshold
     threshold = cm_percent.max() / 2.
     for i in range(num_classes):
         for j in range(num_classes):
             plt.text(j, i, f"{cm[i, j]}\n({cm_percent[i, j]:.1f}%)",
                      ha='center', va='center',
-                     color="white" if cm_percent[i,
-                                                 j] > threshold else "black",
+                     color="white" if cm_percent[i, j] > threshold else "black",
                      fontsize=8)
 
     plt.xlabel("Predicted")

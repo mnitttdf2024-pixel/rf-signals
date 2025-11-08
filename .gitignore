@@ -1,0 +1,52 @@
+# ---------------------------------
+# Python & Virtual Environments
+# ---------------------------------
+# Virtual environment
+venv/
+/venv/
+*.venv/
+env/
+/env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------------------------------
+# Project-Specific Files
+# ---------------------------------
+# Ignore the dataset (too large for Git)
+dataset/
+/dataset/
+
+# Ignore all results, plots, and logs
+vim_results*/
+*.log
+*.csv
+*.png
+
+# Ignore saved model weights
+*.pth
+*.pth.tar
+*.safetensors
+
+# ---------------------------------
+# Common IDE / OS Files
+# ---------------------------------
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/

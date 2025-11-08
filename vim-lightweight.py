@@ -11,16 +11,17 @@ import torchvision.transforms as transforms
 import datetime
 
 # ==============================
-# Import Vision Mamba
+# 1. Import Vision Mamba
 # ==============================
 try:
-    from vision_mamba import Vim
+    # We will use the 'Vim' block from the package you already have
+    from vision_mamba import Vim 
 except ImportError:
     raise ImportError("Install Vision Mamba: pip install vision-mamba")
 
 
 # ==============================
-# 1. Dataset
+# 2. Dataset (Your class)
 # ==============================
 class CustomDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -37,7 +38,6 @@ class CustomDataset(Dataset):
 
             for fname in os.listdir(class_dir):
                 path = os.path.join(class_dir, fname)
-                # Basic check for image files
                 if path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
                     self.images.append((path, self.class_to_idx[cls]))
                 else:
@@ -52,59 +52,48 @@ class CustomDataset(Dataset):
             image = Image.open(img_path).convert('RGB')
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
-            # Return a dummy image and label
-            return torch.randn(3, 128, 128), -1
+            return torch.randn(3, 128, 128), -1 # Use 128x128
 
         if self.transform:
             image = self.transform(image)
 
-        # Handle cases where image loading failed
         if label == -1:
-            return image, torch.tensor(-1)  # Return dummy tensor
+            return image, torch.tensor(-1) 
 
         return image, label
 
 
 # ==============================
-# 2. Model
+# 3. Model
 # ==============================
-class VimForClassification(nn.Module):
-    # ** MODIFIED ** Added more parameters to the init
-    def __init__(self, num_classes, image_size=224, patch_size=16, dim=128,
-                 depth=6, heads=4, dt_rank=16, dim_inner=None, d_state=None, channels=3, dropout=0.2):
-
+class UltraLightVim(nn.Module):
+    def __init__(self, num_classes):
         super().__init__()
-
-        # Set defaults if None
-        dim_inner = dim_inner if dim_inner is not None else dim
-        d_state = d_state if d_state is not None else dim
-
+        
+        # --- Configuration for a VERY SMALL model ---
         self.vim = Vim(
-            dim=dim,
-            # heads=heads,
-            dt_rank=dt_rank,
-            dim_inner=dim_inner,
-            d_state=d_state,
+            dim=96,              # Embedding dimension (very small)
+            image_size=128,      # Your image size
+            patch_size=16,       # 16x16 patches (gives 8x8=64 patches)
+            depth=6,             # Number of Mamba blocks (very few)
+            d_state=16,          # Mamba state dimension (standard)
             num_classes=num_classes,
-            image_size=image_size,
-            patch_size=patch_size,
-            channels=channels,
-            dropout=dropout,
-            depth=depth
+
+            # --- ### FIX ### ---
+            dt_rank=6,           # 96 / 16 = 6
+            dim_inner=96,        # <-- FIX: Set dim_inner == dim
         )
 
     def forward(self, x):
         return self.vim(x)
 
-
 # ==============================
-# 3. Train & Evaluate
+# 4. Train & Evaluate (Your functions)
 # ==============================
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     for images, labels in tqdm(loader, desc="Training", leave=False):
-        # Handle dummy images from loading errors
         if -1 in labels:
             images = images[labels != -1]
             labels = labels[labels != -1]
@@ -120,7 +109,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         total_loss += loss.item() * images.size(0)
 
     if len(loader.dataset) == 0:
-        return 0.0  # Avoid division by zero
+        return 0.0
     return total_loss / len(loader.dataset)
 
 
@@ -130,7 +119,6 @@ def evaluate(model, loader, criterion, device):
     preds_all, labels_all = [], []
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="Validating", leave=False):
-            # Handle dummy images from loading errors
             if -1 in labels:
                 images = images[labels != -1]
                 labels = labels[labels != -1]
@@ -147,91 +135,96 @@ def evaluate(model, loader, criterion, device):
             preds_all.extend(preds.cpu().numpy())
             labels_all.extend(labels.cpu().numpy())
 
-    if len(loader.dataset) == 0 or total == 0:
+    if total == 0:
         return 0.0, 0.0, [], []  # Avoid division by zero
 
     acc = correct / total
-    return total_loss / len(loader.dataset), acc, labels_all, preds_all
+    loss_avg = total_loss / total
+    return loss_avg, acc, labels_all, preds_all
 
 
 # ==============================
-# 4. Main
+# 5. Main
 # ==============================
 def main():
     # --- Config ---
     dataset_root = 'dataset'  # <-- Make sure this folder exists
-    results_dir = 'vim_results_lightweight'  # <-- Changed output dir
+    results_dir = 'vim_results_ultralight_01' # <-- New output dir
     os.makedirs(results_dir, exist_ok=True)
 
-    # --- ** MODIFIED HYPERPARAMETERS ** ---
-    batch_size = 32        # Was 16
-    num_epochs = 50        # Was 20
-    lr = 1e-4              # Was 5e-4
-    patience = 10          # Was 5
-    weight_decay = 1e-3    # Was 1e-4
-    # --- ** END MODIFICATIONS ** ---
+    # --- Hyperparameters ---
+    batch_size = 32        
+    num_epochs = 200       # Training from scratch needs a lot of epochs
+    lr = 5e-4              
+    patience = 25          # Increased patience
+    weight_decay = 5e-3    # Strong regularization (weight decay)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Using device:", device)
+    print(f"Using device: {device}")
 
-    # --- ** MODIFIED DATA AUGMENTATION ** ---
-    # More aggressive augmentation for 128x128 images
-    transform = transforms.Compose([
-        # Use RandomResizedCrop for more variety
-        transforms.RandomResizedCrop((128, 128), scale=(0.8, 1.0)),
+    # --- Data Augmentation (CRITICAL for training from scratch) ---
+    # We need to be very aggressive with augmentation
+    train_transform = transforms.Compose([
+        transforms.TrivialAugmentWide(), # Strong, modern augmentation
+        transforms.Resize(128), # TrivialAugment might change size
+        transforms.RandomCrop(128), # Ensure 128x128
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),  # Slightly more rotation
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
-
-        # TrivialAugment is a strong, modern augmentation technique
-        transforms.TrivialAugmentWide(),
-
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], # Standard ImageNet stats
+                             std=[0.229, 0.224, 0.225])
     ])
-    # --- ** END MODIFICATIONS ** ---
+    
+    val_transform = transforms.Compose([
+        transforms.Resize(128), 
+        transforms.CenterCrop(128),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
 
-    dataset = CustomDataset(dataset_root, transform)
-    if len(dataset) == 0:
-        print(
-            f"Error: No images found in {dataset_root}. Please check the path.")
+    # --- Dataset Splitting ---
+    dataset_for_train = CustomDataset(dataset_root, transform=train_transform)
+    dataset_for_val = CustomDataset(dataset_root, transform=val_transform)
+
+    if len(dataset_for_train) == 0:
+        print(f"Error: No images found in {dataset_root}. Please check.")
         return
 
-    num_classes = len(dataset.classes)
-    print(
-        f"Detected {len(dataset)} images in {num_classes} classes: {dataset.classes}")
+    num_classes = len(dataset_for_train.classes)
+    print(f"Detected {len(dataset_for_train)} images in {num_classes} classes: {dataset_for_train.classes}")
 
-    # --- Split ---
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_size = int(0.8 * len(dataset_for_train))
+    val_size = len(dataset_for_train) - train_size
+    
+    train_subset, val_subset = random_split(
+        dataset_for_train, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    val_subset.dataset = dataset_for_val
+    
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, num_workers=4)
+    # --- End Split ---
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=4)
-
-    # --- ** MODIFIED MODEL INITIALIZATION ** ---
-    print("Initializing Lightweight Vision Mamba (Vim)...")
-    model = VimForClassification(
-        num_classes=num_classes,
-        image_size=128,
-        patch_size=16,  # 8x8=64 patches
-        dim=48,         # smaller than 64
-        depth=3,        # fewer blocks
-        heads=2,
-        dt_rank=8,
-        dropout=0.5     # stronger dropout
-    ).to(device)
-
-    # --- ** END MODIFICATIONS ** ---
+    # --- ### MODEL INITIALIZATION ### ---
+    print("Initializing 'Ultra-Light' Vision Mamba (from scratch)...")
+    model = UltraLightVim(num_classes=num_classes).to(device)
+    
+    # --- Count Parameters ---
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params / 1_000_000:.2f}M")
+    # ---
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        model.parameters(), 
         lr=lr,
-        weight_decay=weight_decay  # <-- Use modified weight_decay
+        weight_decay=weight_decay
     )
+    
+    # Add a learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     # --- Training Loop ---
     best_acc = 0.0
@@ -245,19 +238,21 @@ def main():
             model, train_loader, criterion, optimizer, device)
         val_loss, val_acc, true_labels, preds = evaluate(
             model, val_loader, criterion, device)
+        
+        scheduler.step()
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         metrics_log.append((epoch+1, train_loss, val_loss, val_acc))
 
         print(
-            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {scheduler.get_last_lr()[0]:.1e}")
 
         if val_acc > best_acc:
             best_acc = val_acc
             patience_counter = 0
             torch.save(model.state_dict(), os.path.join(
-                results_dir, "best_vim_model.pth"))
+                results_dir, "best_ultralight_vim_scratch.pth"))
             print("** Saved new best model **")
         else:
             patience_counter += 1
@@ -266,7 +261,7 @@ def main():
                     f"Early stopping triggered after {patience} epochs with no improvement.")
                 break
 
-    # Check if any evaluation was actually run
+    # --- Logging & Plotting ---
     if not true_labels or not preds:
         print("Evaluation did not run. Skipping plots and metrics.")
         print(f"\nAll results saved under: {os.path.abspath(results_dir)}")
@@ -279,45 +274,44 @@ def main():
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.legend()
-    plt.title("Training and Validation Loss (Lightweight Vim)")
-    loss_plot_path = os.path.join(results_dir, "loss_curve.png")
+    plt.title("Training and Validation Loss (Ultra-Light ViM)")
+    loss_plot_path = os.path.join(results_dir, "loss_curve_scratch.png")
     plt.savefig(loss_plot_path)
     print(f"Saved: {loss_plot_path}")
     plt.close()
 
     # --- Confusion Matrix ---
     cm = confusion_matrix(true_labels, preds)
-    cm_percent = cm.astype(float) / cm.sum(axis=1)[:, None] * 100
+    cm_sum = cm.sum(axis=1)[:, None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cm_percent = np.nan_to_num(cm.astype(float) / cm_sum * 100)
 
     plt.figure(figsize=(max(6, num_classes), max(5, num_classes * 0.8)))
-    plt.imshow(cm_percent, cmap='Blues',
-               interpolation='nearest', vmin=0, vmax=100)
+    plt.imshow(cm_percent, cmap='Blues', interpolation='nearest', vmin=0, vmax=100)
     plt.title("Confusion Matrix (%)")
     plt.colorbar()
     ticks = np.arange(num_classes)
-    plt.xticks(ticks, dataset.classes, rotation=45, ha="right")
-    plt.yticks(ticks, dataset.classes)
+    plt.xticks(ticks, dataset_for_train.classes, rotation=45, ha="right")
+    plt.yticks(ticks, dataset_for_train.classes)
 
-    # Text color threshold
     threshold = cm_percent.max() / 2.
     for i in range(num_classes):
         for j in range(num_classes):
             plt.text(j, i, f"{cm[i, j]}\n({cm_percent[i, j]:.1f}%)",
                      ha='center', va='center',
-                     color="white" if cm_percent[i,
-                                                 j] > threshold else "black",
+                     color="white" if cm_percent[i, j] > threshold else "black",
                      fontsize=8)
 
     plt.xlabel("Predicted")
     plt.ylabel("True")
     plt.tight_layout()
-    cm_path = os.path.join(results_dir, "confusion_matrix.png")
+    cm_path = os.path.join(results_dir, "confusion_matrix_scratch.png")
     plt.savefig(cm_path)
     print(f"Saved: {cm_path}")
     plt.close()
 
     # --- Save Metrics Log ---
-    metrics_path = os.path.join(results_dir, "training_metrics.csv")
+    metrics_path = os.path.join(results_dir, "training_metrics_scratch.csv")
     with open(metrics_path, "w") as f:
         f.write("Epoch,Train_Loss,Val_Loss,Val_Accuracy\n")
         for e, tr, vl, acc in metrics_log:
